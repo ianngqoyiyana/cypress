@@ -83,17 +83,31 @@ const _cookieMatches = (cookie: any, filter: Record<string, any>) => {
 let requestIdCounter = 1
 const requestIdMap = new WeakMap<playwright.Request, string>()
 
-export class WebkitAutomation {
+type WebKitAutomationOpts = {
+  automation: Automation
+  browser: playwright.Browser
+  shouldMarkAutIframeRequests: boolean
+  initialUrl: string
+}
+
+export class WebKitAutomation {
+  automation: Automation
+  private browser: playwright.Browser
   private context!: playwright.BrowserContext
   private page!: playwright.Page
+  private shouldMarkAutIframeRequests: boolean
 
-  private constructor (public automation: Automation, private browser: playwright.Browser) {}
+  private constructor (opts: WebKitAutomationOpts) {
+    this.automation = opts.automation
+    this.browser = opts.browser
+    this.shouldMarkAutIframeRequests = opts.shouldMarkAutIframeRequests
+  }
 
   // static initializer to avoid "not definitively declared"
-  static async create (automation: Automation, browser: playwright.Browser, initialUrl: string) {
-    const wkAutomation = new WebkitAutomation(automation, browser)
+  static async create (opts: WebKitAutomationOpts) {
+    const wkAutomation = new WebKitAutomation(opts)
 
-    await wkAutomation.reset(initialUrl)
+    await wkAutomation.reset(opts.initialUrl)
 
     return wkAutomation
   }
@@ -109,7 +123,9 @@ export class WebkitAutomation {
     this.page = await newContext.newPage()
     this.context = this.page.context()
 
-    this.attachListeners(this.page)
+    this.attachRequestListeners()
+
+    if (this.shouldMarkAutIframeRequests) await this._markAutIframeRequests()
 
     let promises: Promise<any>[] = []
 
@@ -120,9 +136,31 @@ export class WebkitAutomation {
     if (promises.length) await Promise.all(promises)
   }
 
-  private attachListeners (page: playwright.Page) {
+  private async _markAutIframeRequests () {
+    function isAutIframeRequest (request: playwright.Request) {
+      // is an iframe
+      return (request.resourceType() === 'document')
+        // is a top-level iframe (only 1 parent in chain)
+        && request.frame().parentFrame() && !request.frame().parentFrame()?.parentFrame()
+        // is not the runner itself
+        && !request.url().includes('__cypress')
+    }
+
+    await this.context.route('**', (route, request) => {
+      if (!isAutIframeRequest(request)) return route.continue()
+
+      return route.continue({
+        headers: {
+          ...request.headers(),
+          'X-Cypress-Is-AUT-Frame': 'true',
+        },
+      })
+    })
+  }
+
+  private attachRequestListeners () {
     // emit preRequest to proxy
-    page.on('request', async (request) => {
+    this.context.on('request', (request) => {
       // ignore socket.io events
       // TODO: use config.socketIoRoute here instead
       if (request.url().includes('/__socket') || request.url().includes('/__cypress')) return
@@ -146,7 +184,7 @@ export class WebkitAutomation {
       this.automation.onBrowserPreRequest?.(browserPreRequest)
     })
 
-    page.on('requestfinished', async (request) => {
+    this.context.on('requestfinished', async (request) => {
       const requestId = requestIdMap.get(request)
 
       if (!requestId) return
@@ -220,11 +258,14 @@ export class WebkitAutomation {
         return await this.getCookie(data)
       case 'set:cookie':
         return await this.context.addCookies([normalizeSetCookieProps(data)])
-      case 'add:cookies':
       case 'set:cookies':
+        await this.context.clearCookies()
+
+        return await this.context.addCookies(data.map(normalizeSetCookieProps))
+      case 'add:cookies':
         return await this.context.addCookies(data.map(normalizeSetCookieProps))
       case 'clear:cookies':
-        return await this.context.clearCookies()
+        return await Promise.all(data.map((cookie) => this.clearCookie(cookie)))
       case 'clear:cookie':
         return await this.clearCookie(data)
       case 'take:screenshot':
